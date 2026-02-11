@@ -1,0 +1,180 @@
+import os
+import re
+import time
+import requests
+import socket
+from datetime import datetime
+import threading
+import itertools
+import sqlite3
+
+# 企业微信 Webhook
+WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=d2544780-78a2-4680-9059-a786d0ae850d"
+
+# 日志保存目录
+log_dir = r"C:\Users\Administrator\Desktop\GZWXD\GZWXD_log\usglog\usgips\usgips_original_log"
+os.makedirs(log_dir, exist_ok=True)
+
+# SQLite 根目录（每天新建一个库）
+DB_BASE_DIR = r"C:\Users\Administrator\Desktop\GZWXD\GZWXD_log\usglog\usgips"
+os.makedirs(DB_BASE_DIR, exist_ok=True)
+
+def get_db_path():
+    today = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(DB_BASE_DIR, f"alert_history_{today}.db")
+
+def ensure_db_exists():
+    db_path = get_db_path()
+    if not os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT,
+                src_ip TEXT,
+                dst_ip TEXT,
+                sign_name TEXT,
+                severity TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+def insert_alert_to_db(time_str, src_ip, dst_ip, sign_name, severity):
+    try:
+        ensure_db_exists()
+        db_path = get_db_path()
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO alerts (time, src_ip, dst_ip, sign_name, severity)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (time_str, src_ip, dst_ip, sign_name, severity))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"❌ 写入数据库失败: {e}")
+
+def send_wechat_alert(content):
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {
+            "content": content
+        }
+    }
+    try:
+        resp = requests.post(WEBHOOK_URL, headers=headers, json=payload)
+        if resp.status_code == 200:
+            print("✅ Webhook 告警发送成功")
+        else:
+            print(f"❌ Webhook 告警发送失败: {resp.text}")
+    except Exception as e:
+        print(f"❌ 请求 webhook 异常: {e}")
+
+def format_ips_alert(log_message):
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        zh_pattern = (
+            r'源IP=(?P<src_ip>[\d.]+),\s*目的IP=(?P<dst_ip>[\d.]+),\s*'
+            r'源端口=(?P<src_port>\d+),\s*目的端口=(?P<dst_port>\d+),.*?'
+            r'协议=(?P<protocol>\w+),\s*应用=(?P<application>[^,]+),.*?'
+            r'攻击名称="?(?P<sign_name>[^",]+)"?,.*?'
+            r'等级=(?P<severity>\w+),.*?'
+            r'处置动作=(?P<action>\w+)'
+        )
+
+        en_pattern = (
+            r'src_ip=(?P<src_ip>[\d.]+).*?dst_ip=(?P<dst_ip>[\d.]+).*?'
+            r'src_port=(?P<src_port>\d+).*?dst_port=(?P<dst_port>\d+).*?'
+            r'protocol=(?P<protocol>\w+).*?app=(?P<application>[^,]+).*?'
+            r'sign_name=(?P<sign_name>[^,]+).*?'
+            r'severity=(?P<severity>\w+).*?'
+            r'action=(?P<action>\w+)'
+        )
+
+        match = re.search(zh_pattern, log_message)
+        if not match:
+            match = re.search(en_pattern, log_message)
+
+        if match:
+            info = match.groupdict()
+            content = (
+                f"🚨 **华为IPS 入侵防御告警** 🚨\n"
+                f"告警时间：{now}\n"
+                f"攻击名称：{info['sign_name']}\n"
+                f"攻击等级：{info['severity']}\n"
+                f"源IP：{info['src_ip']}（端口：{info['src_port']}）\n"
+                f"目的IP：{info['dst_ip']}（端口：{info['dst_port']}）\n"
+                f"协议：{info['protocol']}\n"
+                f"应用：{info['application']}\n"
+                f"处置动作：{info['action']}"
+            )
+
+            insert_alert_to_db(
+                now,
+                info["src_ip"],
+                info["dst_ip"],
+                info["sign_name"],
+                info["severity"]
+            )
+
+            return content
+        else:
+            print(f"❌ 告警解析失败: {log_message}")
+            return None
+    except Exception as e:
+        print(f"❌ 解析异常: {e}")
+        return None
+
+def show_running_indicator():
+    for c in itertools.cycle(['|', '/', '-', '\\']):
+        print(f"\r✅ 正在监听 0.0.0.0:{UDP_PORT} 端口，仅处理华为防火墙 IPS 告警... {c}", end='', flush=True)
+        time.sleep(0.5)
+
+# UDP 监听配置
+UDP_IP = "0.0.0.0"
+UDP_PORT = 10514
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65535)
+sock.bind((UDP_IP, UDP_PORT))
+
+# 动画线程启动
+t = threading.Thread(target=show_running_indicator)
+t.daemon = True
+t.start()
+
+# 主循环
+while True:
+    try:
+        data, addr = sock.recvfrom(65535)
+        try:
+            log_message = data.decode('utf-8')
+        except UnicodeDecodeError:
+            log_message = data.decode('utf-8', errors='ignore')
+
+        log_message = log_message.strip()
+
+        if "POLICY" in log_message:
+            continue
+        if not re.search(r'IPS/4/', log_message):
+            continue
+
+        formatted_alert = format_ips_alert(log_message)
+        if formatted_alert:
+            send_wechat_alert(formatted_alert)
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            log_file_path_utf8 = os.path.join(log_dir, f"{today}_usgips_utf8.log")
+            log_file_path_gbk = os.path.join(log_dir, f"{today}_usgips_gbk.log")
+
+            with open(log_file_path_utf8, 'a', encoding='utf-8') as f:
+                f.write(log_message + "\n")
+
+            with open(log_file_path_gbk, 'a', encoding='gbk', errors='ignore') as f:
+                f.write(log_message + "\n")
+
+    except Exception as e:
+        print(f"\n❌ 主循环异常: {e}")
